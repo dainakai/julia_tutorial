@@ -18,10 +18,14 @@ Julia言語は、2012年にMITのAlan Edelman氏らによって開発された�
   - [2次元プロット](#2次元プロット)
   - [3次元プロット](#3次元プロット)
   - [その他の例](#その他の例)
-- [Distributed.jl](#distributedjl)
+- [Threads.jl, Distributed.jl](#threadsjl-distributedjl)
 - [Spinnaker.jl](#spinnakerjl)
 - [CUDA.jl](#cudajl)
+  - [Array Programming](#array-programming)
+  - [Kernel Programming](#kernel-programming)
 - [ParticleHolography.jl](#particleholographyjl)
+- [Tips](#tips)
+  - [ProgressMeter.jl](#progressmeterjl)
 
 
 ## Installation
@@ -722,9 +726,163 @@ Plots.jlとは別のパッケージである[Makie.jl](https://docs.makie.org/v0
 
 ![bundleadjustment.png](./figs/before_BA.jpg)
 
-# Distributed.jl
+# Threads.jl, Distributed.jl
+[Threads.jl](https://docs.julialang.org/en/v1/manual/multi-threading/), [Distributed.jl](https://github.com/JuliaLang/Distributed.jl?tab=readme-ov-file)はスレッド並列やプロセス並列、マルチノードでの計算を行うための標準ライブラリです。JuliaではC言語などのように一文pragmaを加えるだけで簡単にスレッド並列できる、というわけではありませんが、決して難しくはありません。スレッド並列はPythonは苦手なのでアドバンテージがあります。また、Pythonでは簡単なプロセス並列はC言語ではすこし面倒ですがJuliaでは非常に簡単です。Juliaではこういった並列処理が非常に簡単にできるので、大規模な計算を行う場合には非常に有用です。この記事では、Distributed.jlによるシングルノードのプロセス並列について簡単に書きます。
+
+配列の各成分を読み込んでその２乗を計算し`println()`で表示するプロセス並列処理を考えます。
+
+```julia
+using Distributed
+
+addprocs(4)
+@everywhere function f(x)
+    println("Input: ", x, " Output: ", x^2)
+end
+
+x = 1:4
+pmap(f, x)
+```
+
+```julia
+      From worker 2:    Input: 2 Output: 4
+      From worker 3:    Input: 4 Output: 16
+      From worker 5:    Input: 1 Output: 1
+      From worker 4:    Input: 3 Output: 9
+4-element Vector{Nothing}:
+ nothing
+ nothing
+ nothing
+ nothing
+```
+
+`addprocs(4)`で4つのワーカープロセスを追加し、`@everywhere`で関数`f()`を全てのプロセスに送信します。`pmap()`関数は`map()`関数と同じですが、プロセス並列で処理を行います。このとき、メインプロセスは処理を行わないので`f()`の計算を行うプロセス数は4です。この処理は非常に簡単ですが、たとえば`x`が時系列画像データのパスの配列で、それぞれを処理して結果を保存する場合などに便利です。
 
 
 # Spinnaker.jl
+[Spinnaker.jl](https://github.com/samuelpowell/Spinnaker.jl)はFLIRカメラを制御するためのパッケージです。使用時にはSpinaker SDKのインストールが必要です。また、[C++のドキュメント](https://softwareservices.flir.com/Spinnaker/latest/_programmer_guide.html)を先に読みましょう。Juliaラッパーに関してはパッケージのドキュメントが十分丁寧かつ詳細に書いていますので説明は省略します。
+
 # CUDA.jl
+[CUDA.jl](https://cuda.juliagpu.org/stable/)はJuliaでNVIDIA GPUを使って並列計算をするためのパッケージです。この記事では、CUDA.jlを使ってカーネルプログラミングをするために必要なことのみを簡単に説明しますが、[CUDAのプログラミングモデル](https://download.nvidia.com/developer/cuda/jp/CUDA_Programming_Model_jp.pdf)などで簡単に学習することをおすすめします。
+
+## Array Programming
+はじめに、カーネルを定義せずにGPUで配列計算をしてみます。`CUDA.jl`パッケージでは、抽象化された型の引数を取れる関数とブロードキャストによってカーネルを定義しなくても、GPUで計算を行うことができます。
+
+```julia
+using CUDA
+
+a = CUDA.fill(1.0f0, 10)
+b = CUDA.fill(2.0f0, 10)
+c = a .+ b
+```
+
+```julia
+10-element CuArray{Float32, 1}:
+3.0
+3.0
+3.0
+3.0
+3.0
+3.0
+3.0
+3.0
+3.0
+3.0
+```
+
+これも例によって一度目の実行はコンパイルが必要なので多少時間がかかりますが、２回目以降は高速に計算できます。高速な計算をするためのコツは、繰り返される計算ごとに変数の型が変わらないようにすることです。
+
+ホスト（CPU）、デバイス（GPU）間のデータ転送は以下のように行います。
+
+```julia
+a = rand(10) # CPU上の配列
+d_a = cu(a) # GPU上の配列
+b = Array(d_a) # CPU上の配列
+a == b # true
+```
+
+CUDA.jlではユニファイドメモリは実装されていません。そのため、データの転送は明示的に行う必要があります。
+
+実は、Gerchberg-Saxtonアルゴリズムはカーネルの定義なしで実装できます。
+
+```julia
+"""
+    cu_phase_retrieval_holo(holo1, holo2, transfer, invtransfer, priter, datlen)
+
+Perform the Gerchberg-Saxton algorithm-based phase retrieving on two holograms and return the retrieved wavefront at the z-coordinate point of `holo1`. The algorithm is repeated `priter` times. `holo1` and `holo2` are the holograms (I = |phi|^2) of the object at two different z-coordinates. `transfer` and `invtransfer` are the transfer functions for the propagation from `holo1` to `holo2` and vice versa. `datlen` is the size of the holograms.
+
+# Arguments
+- `holo1::CuArray{Float32,2}`: The hologram at the z-cordinate of closer to the object.
+- `holo2::CuArray{Float32,2}`: The hologram at the z-coordinate of further from the object.
+- `transfer::CuTransfer{ComplexF32}`: The transfer function from `holo1` to `holo2`.
+- `invtransfer::CuTransfer{ComplexF32}`: The transfer function from `holo2` to `holo1`.
+- `priter::Int`: The number of iterations to perform the algorithm.
+- `datlen::Int`: The size of the holograms.
+
+# Returns
+- `CuWavefront{ComplexF32}`: The retrieved wavefront at the z-coordinate of `holo1`. See [`CuWavefront`](@ref).
+"""
+function cu_phase_retrieval_holo(holo1::CuArray{Float32,2}, holo2::CuArray{Float32,2}, transfer::CuTransfer{ComplexF32}, invtransfer::CuTransfer{ComplexF32}, priter::Int, datlen::Int)
+    @assert size(holo1) == size(holo2) == size(transfer.data) == size(invtransfer.data) == (datlen, datlen) "All arrays must have the same size as ($datlen, $datlen). Got $(size(holo1)), $(size(holo2)), $(size(transfer.data)), $(size(invtransfer.data))."
+
+    light1 = CuArray{ComplexF32}(undef, datlen, datlen)
+    light2 = CuArray{ComplexF32}(undef, datlen, datlen)
+    phi1 = CuArray{Float32}(undef, datlen, datlen)
+    phi2 = CuArray{Float32}(undef, datlen, datlen)
+    sqrtI1 = sqrt.(holo1)
+    sqrtI2 = sqrt.(holo2)
+
+    light1 .= sqrtI1 .+ 0.0im
+
+    for _ in 1:priter
+        # STEP1
+        light2 .= CUFFT.ifft(CUFFT.ifftshift(CUFFT.fftshift(CUFFT.fft(light1)).*transfer.data))
+        phi2 .= angle.(light2)
+
+        # STEP2
+        light2 .= sqrtI2.*exp.(1.0im.*phi2)
+
+        # STEP3
+        light1 .= CUFFT.ifft(CUFFT.ifftshift(CUFFT.fftshift(CUFFT.fft(light2)).*invtransfer.data))
+        phi1 .= angle.(light1)
+
+        # STEP4
+        light1 .= sqrtI1.*exp.(1.0im.*phi1)
+    end
+
+    return CuWavefront(light1)
+end
+```
+
+## Kernel Programming
+カーネルとは、GPU上で並列計算を行うための関数です。CUDA C/C++では、`__global__`修飾子などを使ってカーネルを定義しましたが、CUDA.jlでは普通の関数と同じように定義します。ただし、実行時には`@cuda`マクロを使ってGPU上で実行することを指定します。
+
+```julia
+function kernel_vadd(a, b, c)
+    i = threadIdx().x
+    c[i] = a[i] + b[i]
+    return
+end
+
+a = rand(10)
+b = rand(10)
+c = similar(a)
+@cuda threads=10 kernel_vadd(a, b, c)
+```
+
 # ParticleHolography.jl
+
+# Tips
+## ProgressMeter.jl
+[ProgressMeter.jl](https://github.com/timholy/ProgressMeter.jl)は進捗バーを表示するためのパッケージです。`@showprogress`マクロを使います。残り時間がわかるので便利です。
+
+```julia
+using ProgressMeter
+
+@showprogress for i in 1:100
+    sleep(0.1)
+end
+```
+
+```julia
+Progress: 100%|█████████████████████████████████████████| Time: 0:00:11
+```
