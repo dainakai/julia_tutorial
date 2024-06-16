@@ -802,7 +802,43 @@ a == b # true
 
 CUDA.jlではユニファイドメモリは実装されていません。そのため、データの転送は明示的に行う必要があります。
 
-実は、Gerchberg-Saxtonアルゴリズムはカーネルの定義なしで実装できます。
+GPU上の配列、つまり`CuArray`はインデックスによるアクセスはしない方が良いですが、スライスの生成は可能です。
+
+```julia
+d_a = CUDA.rand(10)
+d_slice = d_a[1:5]
+```
+
+```julia
+5-element CuArray{Float32, 1, CUDA.Mem.DeviceBuffer}:
+ 0.15957302
+ 0.42396468
+ 0.41466224
+ 0.8685566
+ 0.11615878
+```
+
+このスライスはもとの配列のコピーなので、GPUのVRAMを新たに確保します。また、`d_slice`を変更しても`d_a`は変更されません。
+
+新たなVRAMを確保せず、値を変更するともとの配列も変更されるような配列の参照はビューとよばれ、以下のように生成できます。
+
+```julia
+d_a = CUDA.rand(10)
+@views d_view = d_a[1:5]
+```
+
+GPU配列の一部または全部の値を更新する場合は、代入演算子に注意してください。
+
+```julia
+d_a = CUDA.rand(10)
+d_a .= 1.0f0 # すべての配列の要素をFloat32の1.0に更新する。更新後もGPU配列であり、この代入操作もGPU上で行われる。
+
+d_a = CUDA.rand(10)
+d_a = 1.0f0 # GPU配列`d_a`を破棄してCPU上でFloat32の1.0の変数になる。更新後はGPU配列でなくなる。
+```
+
+スライスとブロードキャストは非常に強力で、CUDA C/C++で書いていたよりもカーネルの数は格段に減ります。光伝搬計算も伝達関数の初期化にはカーネルが必要ですが、フーリエ変換による畳み込みではカーネルは不要です。したがって、実は、Gerchberg-Saxtonアルゴリズムもカーネルの定義なしで実装できます。
+
 
 ```julia
 """
@@ -854,13 +890,17 @@ end
 ```
 
 ## Kernel Programming
-カーネルとは、GPU上で並列計算を行うための関数です。CUDA C/C++では、`__global__`修飾子などを使ってカーネルを定義しましたが、CUDA.jlでは普通の関数と同じように定義します。ただし、実行時には`@cuda`マクロを使ってGPU上で実行することを指定します。
+カーネルとは、GPU上で並列計算を行うための関数です。たとえばCUDA C/C++で`__global__`修飾子を使って定義されるカーネルは、ホストで呼び出された後、GPU上の各CUDAコアで実行されます。これをスレッドと呼びましょう。各スレッドは固有のアドレスが与えられています。アドレスは、各スレッドから`threadIdx`と`blockIdx`変数にアクセスして取得できます。`blockIdx`は都道府県名、`threadIdx`は市町村名のようなもので、１次元か２次元か３次元のベクトルで表現されます。事前にユーザが定義したスレッドとブロックの大きさによって各スレッドでのアドレスが計算でき、それを配列のインデックスとして配列の各要素に対してスレッドごとに計算を行います。NVIDIA GPUにはCUDAコアが非常に多く実装されているため高速な計算が可能になります。
+
+CUDA.jlでは普通の関数と同じようにカーネルを定義し、スレッド数、ブロック数を指定して`@cuda`マクロで実行します。以下は、ベクトルの要素ごとの和を計算するカーネルの例です。
 
 ```julia
 function kernel_vadd(a, b, c)
-    i = threadIdx().x
-    c[i] = a[i] + b[i]
-    return
+    i = threadIdx().x # スレッドのインデックスを取得。１から始まることに注意
+    if i <= length(a)
+        @inbounds c[i] = a[i] + b[i] # @inboundsは境界チェックを無効にするマクロ
+    end
+    return nothing # カーネルは何も返さない
 end
 
 a = rand(10)
@@ -869,7 +909,43 @@ c = similar(a)
 @cuda threads=10 kernel_vadd(a, b, c)
 ```
 
+２次元配列に対するカーネルの例を見ましょう。以下は、光伝搬のための伝達関数の平方根部分の計算を行うカーネルです。
+
+```julia
+function _cu_transfer_sqrt_arr!(Plane, datLen, wavLen, dx)
+    x = (blockIdx().x-1)*blockDim().x + threadIdx().x
+    y = (blockIdx().y-1)*blockDim().y + threadIdx().y
+    if x <= datLen && y <= datLen
+        @inbounds Plane[x,y] = 1.0 - ((x-datLen/2)*wavLen/datLen/dx)^2 - ((y-datLen/2)*wavLen/datLen/dx)^2
+    end
+    return nothing
+end
+
+"""
+    cu_transfer_sqrt_arr(datlen, wavlen, dx)
+
+Create a CuArray of size `datlen` x `datlen` with the values of the square-root part of the transfer function.
+
+# Arguments
+- `datlen::Int`: The size of the CuArray.
+- `wavlen::AbstractFloat`: The wavelength of the light.
+- `dx::AbstractFloat`: The pixel size of the hologram.
+
+# Returns
+- `CuTransferSqrtPart{Float32}`: The square-root part of the transfer function. See [`CuTransferSqrtPart`](@ref).
+"""
+function cu_transfer_sqrt_arr(datlen::Int, wavlen::AbstractFloat, dx::AbstractFloat)
+    Plane = CuArray{Float32}(undef, datlen, datlen) # 出力用の配列を確保
+    threads = (32, 32)
+    blocks = cld.((datlen, datlen), threads) # datlenをthreadsで割って切り上げる
+    @cuda threads=threads blocks=blocks _cu_transfer_sqrt_arr!(Plane, datlen, wavlen, dx)
+    return CuTransferSqrtPart(Plane)
+end
+```
+
 # ParticleHolography.jl
+[ParticleHolography.jl](https://dainakai.github.io/ParticleHolography.jl/dev/)はインラインホログラフィで粒子計測を行うためのJuliaパッケージで、私が作りました。他のパッケージと同様にインストールできます。ドキュメントから説明をします。
+
 
 # Tips
 ## ProgressMeter.jl
